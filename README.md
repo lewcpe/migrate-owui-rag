@@ -162,3 +162,63 @@ still runs).
 - Chroma's wrapped `.get()` omits embeddings; the script calls the underlying
   `Collection.get(include=["embeddings", ...])` directly.
 - Milvus server image version must match `pymilvus` (v2.6.14).
+
+## Chunking analysis: migration vs. direct insert
+
+A natural question is whether migrating an existing Chroma store into a target
+backend yields the **same** vectors as if Open WebUI had been writing to that
+target backend all along. In general it does **not**, and the reason is rooted
+in how Open WebUI writes to Chroma, not in the migration script.
+
+### What the migration preserves
+
+The migration is a faithful, lossless copy of whatever Chroma already stored:
+every Chroma point (id, document text, embedding, metadata) is re-created 1:1 in
+the target via `upsert`. The existing `test_offline_migration_chroma_to_vector`
+test asserts exactly this (id sets match, and verbatim document text matches).
+
+### Where the two paths diverge
+
+Open WebUI's `ChromaClient.insert` does **not** store the items you hand it
+verbatim. It re-splits each item into several finer sub-documents. In the test
+scenario (30 documents × 6 paragraphs, chunked with the langchain
+`RecursiveCharacterTextSplitter` at `chunk_size=1000`, `chunk_overlap=100`):
+
+| Path | Input chunks | Stored vectors | Chunk granularity |
+| --- | --- | --- | --- |
+| Direct insert into Qdrant/Milvus (`ingest_documents` → `client.insert`) | 60 | **60** | one vector per langchain chunk |
+| Insert into Chroma, then migrate to Qdrant/Milvus | 60 → Chroma → migrate | **~180** | Chroma re-split each item into ~3 finer sub-documents |
+
+So a Chroma → Qdrant migration produces roughly **3× more, shorter chunks**
+than a direct Qdrant insert of the same source documents, and the individual
+chunk texts differ (Chroma's fragments are finer than the langchain chunks).
+This was confirmed empirically: 60 langchain chunks produced **180** documents
+in Chroma (lengths ~400–810 chars), whereas the direct Qdrant insert kept the
+60 original langchain chunks.
+
+### Why this is expected, not a bug
+
+- The migration copies Chroma's *actual* stored layout. Reconstructing the
+  finer Chroma chunks in the target is the **correct** behaviour — it means the
+  migrated store behaves exactly like the Chroma store it came from (same
+  search results, same retrieval).
+- The difference originates entirely in the **source** backend (Chroma's
+  client re-chunks on write). A direct insert into Qdrant/Milvus bypasses
+  Chroma, so it keeps the coarser langchain chunking.
+- The exact ratio depends on document length and the configured chunk size /
+  overlap; it is not a fixed constant.
+
+### How the test accounts for this
+
+Because ids, counts and per-chunk vectors legitimately differ between the two
+paths, `test_direct_insert_vs_chroma_migration` does **not** assert
+byte-identical collections. Instead it groups each store's points by
+`metadata.hash` (the original source document) and verifies that **every
+original line of text is recoverable from both stores**. Both paths preserve
+the same underlying knowledge — they just slice it differently.
+
+**Takeaway:** prefer migrating Chroma → target over standing up a fresh target
+store and re-ingesting, *if* you want the new store to match the existing
+Chroma-backed experience. If instead you re-ingest the same files directly into
+the target backend, you will get coarser chunks and therefore different search
+behaviour than the Chroma system you are replacing.
