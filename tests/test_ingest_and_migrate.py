@@ -251,10 +251,11 @@ def test_direct_insert_vs_chroma_migration(chroma_client, dst_client, embedding_
     target store via ``migrate``.
 
     The two paths do NOT produce byte-identical collections: Chroma's client
-    re-chunks each item into finer pieces, so point ids, counts and per-chunk
-    vectors differ between the two stores. What must match is the underlying
-    content -- every original document's text must be fully recoverable from
-    both stores (checked line-by-line, grouped by ``metadata.hash``).
+    The two paths produce equivalent data because Open WebUI chunks identically
+    regardless of vector DB and every backend stores chunks as‑is (confirmed
+    in tests: N items → N stored documents/images. ChromaClient.insert does
+    NOT re‑split).  The only differences are backend‑level details (id format);
+    point counts and per‑chunk texts are the same.
     """
     name_direct = "kb-direct"
     name_migrated = "kb-migrated"

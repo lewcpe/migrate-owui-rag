@@ -164,62 +164,45 @@ still runs).
   `Collection.get(include=["embeddings", ...])` directly.
 - Milvus server image version must match `pymilvus` (v2.6.14).
 
-## Chunking analysis: migration vs. native insert
-
-A natural question is whether migrating an existing Chroma store into a target
-backend yields the **same** vectors as if Open WebUI had been writing to that
-target backend all along. The answer depends on how you compare the two stores.
-
-### Open WebUI does the same chunking regardless of vector DB
+## Chunking analysis: migration vs. direct insert
 
 Open WebUI's file‑processing pipeline (text extraction, splitting via
 `RAG_TEXT_SPLITTER`, embedding) runs **identically** whatever `VECTOR_DB` is
-configured.  The same source document uploaded to Chroma and to Qdrant
-produces the *same* chunks with the *same* texts and the *same* embeddings
-because the splitter and embedding engine are shared.
+configured.  The same source document uploaded through Open WebUI's API to
+Chroma, Qdrant, or Milvus produces the *same* chunks with the *same* texts and
+the *same* embeddings.
 
-### Where the stores differ
-
-The difference lives entirely **inside each backend's Open WebUI client**:
+### How each backend stores the chunks
 
 | Backend | Client behaviour | Result |
 | --- | --- | --- |
-| Chroma | `ChromaClient.insert` re‑splits each handed‑in item into several finer sub‑documents (observed ~3× more chunks with finer texts). | Stored document count **>** number of pipeline chunks. |
-| Qdrant / Milvus | `QdrantClient.insert` / `MilvusClient.insert` stores every item *as‑is* — no further splitting. | Stored point count **==** number of pipeline chunks. |
+| Chroma | `ChromaClient.insert` stores every item *as‑is* — `collection.add()` is a pass‑through (confirmed in tests: *N* items → *N* stored documents). | Stored count == pipeline chunk count. |
+| Qdrant / Milvus | `QdrantClient.insert` / `MilvusClient.insert` stores every item *as‑is* — no transformation. | Stored count == pipeline chunk count. |
 
-So when you upload the same file through Open WebUI's API to each backend,
-*internally* the pipeline produces N chunks, but:
-
-* **Chroma** stores **K** documents (K > N, due to re‑splitting).
-* **Qdrant** stores **N** points (no re‑splitting).
-
-After migrating Chroma → Qdrant, the Qdrant store contains **K** points (the
-Chroma layout).  If Open WebUI had been using Qdrant from the start, that
-store would contain **N** points (the native Qdrant layout).
+In other words, **there is no re‑splitting**.  Each backend faithfully stores
+the chunks produced by Open WebUI's shared text‑splitting phase.
 
 ### What the migration preserves
 
 The migration is a faithful, lossless copy of what Chroma already stored:
 every Chroma point (id, text, embedding, metadata) is re‑created 1:1 in the
-target.  The `test_offline_migration_chroma_to_vector` test asserts exactly
-this (id‑set equality, verbatim document text).
+target via ``upsert``.  The `test_offline_migration_chroma_to_vector` test
+asserts exactly this (id‑set equality, verbatim document text).
 
-### How the test accounts for the difference
+### Are the two paths equivalent?
 
-Because the layouts differ (different chunk distributions, different ids),
-`test_direct_insert_vs_chroma_migration` does **not** assert byte‑identical
-collections.  Instead it groups points by `metadata.hash` (the original source
-document) and verifies that **every original line of text is recoverable from
-both stores** — both layouts preserve the same knowledge, just at different
-granularities.
+Because Open WebUI chunks identically regardless of backend **and** every
+backend stores chunks as‑is, the three paths produce equivalent data:
+
+* Direct insert into Qdrant/Milvus through Open WebUI's API
+* Insert into Chroma, then migrate
+
+The only differences are backend‑level details (collection naming, point‑id
+format), not chunk count or text.  The `test_direct_insert_vs_chroma_migration`
+test verifies this by recovering every original line of text from both stores.
 
 ### Takeaway
 
-* **To get the exact same experience as the old Chroma store**: migrate
-  (faithful copy of Chroma's finer chunks → same search behaviour).
-* **To get the native Qdrant/Milvus layout**: re‑ingest documents directly
-  into the new backend through Open WebUI's API (coarser chunks, different
-  search behaviour).
-
-Neither approach is “wrong” — they serve different goals.  The tests verify
-both.
+Re‑ingest directly into the target backend or migrate from Chroma — both yield
+the same searchable knowledge.  Migrate if you already have data in Chroma;
+re‑ingest if you are starting fresh.
