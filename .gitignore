@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# Test / runtime artifacts
+vector_db/
+data/
+volumes/
+.pytest_cache/
+.milvus/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
