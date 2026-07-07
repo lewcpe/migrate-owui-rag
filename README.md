@@ -116,6 +116,7 @@ python migrate_chroma.py --dest qdrant --batch 500 --verify
 | `--batch` | — | upsert batch size (default 500) |
 | `--collections` | — | migrate only these collection names |
 | `--dry-run` | — | list collections/counts, write nothing |
+| `--incremental` | — | only migrate Chroma ids missing from the target (resumable sync) |
 | `--verify` | — | compare per-collection id sets afterwards |
 
 The script targets the **standard** Milvus mode. Milvus *multitenancy* mode

@@ -125,10 +125,18 @@ def migrate(
     batch_size: int = 500,
     collection_filter: Optional[List[str]] = None,
     dry_run: bool = False,
+    incremental: bool = False,
 ) -> dict:
     """Read every Chroma collection (with embeddings) and upsert into the target.
 
     Returns a summary dict: ``{"dest": str, "collections": [(name, n), ...], "total": int}``.
+
+    When ``incremental`` is True, only the Chroma points whose ids are **not**
+    already present in the target are migrated (a diff). This makes the
+    migration resumable: you can run it once, keep writing to Chroma, and run
+    it again later to sync just the new data without re-processing everything.
+    Because ``upsert`` is idempotent on id, a non-incremental re-run is always
+    safe too, but re-processes every collection.
     """
     chroma = src_client.client
     collections = chroma.list_collections()
@@ -165,6 +173,17 @@ def migrate(
             }
             for idx, i in enumerate(ids)
         ]
+
+        if incremental and not dry_run:
+            # Diff: only migrate points missing from the target. A missing
+            # target collection means "migrate everything".
+            if dst_client.has_collection(name):
+                existing = _all_ids(dst_client, name)
+                items = [it for it in items if it["id"] not in existing]
+            if not items:
+                log.info(f"[skip] {name}: nothing to migrate (already present)")
+                summary["collections"].append((name, 0))
+                continue
 
         if dry_run:
             log.info(f"[dry-run] {name}: would migrate {len(items)} vector(s)")
@@ -328,6 +347,11 @@ def main() -> int:
         help="Only migrate these specific collection names.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Only migrate Chroma ids missing from the target (resumable sync).",
+    )
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
 
@@ -343,6 +367,7 @@ def main() -> int:
         batch_size=args.batch,
         collection_filter=args.collections,
         dry_run=args.dry_run,
+        incremental=args.incremental,
     )
     log.info(
         f"Summary ({summary['dest']}): {summary['total']} vectors across "

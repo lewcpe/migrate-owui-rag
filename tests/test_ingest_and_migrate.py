@@ -330,3 +330,41 @@ def test_migrated_store_works_with_openwebui(chroma_client, dst_client, embeddin
     remaining = _all_ids(dst_client, name)
     assert victim not in remaining
     assert len(remaining) == len(after_ids) - 1
+
+
+@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"], indirect=True)
+def test_incremental_migration(chroma_client, dst_client, embedding_function):
+    """Migration must be resumable: run it, keep writing to Chroma, then run it
+    again and only the *new* data should be migrated (the diff).
+
+    This models the "migrate but don't switch yet" workflow: Chroma stays the
+    live store, the target is synced periodically, and a re-run must not
+    re-process what is already present and must not duplicate.
+    """
+    names = [_kb_collection_name(k) for k in range(3)]
+
+    # Phase 1: seed Chroma with two KBs and do the first (full) migration.
+    for kb in (0, 1):
+        ingest_documents(chroma_client, names[kb], _make_documents(kb, 0), embedding_function)
+    summary1 = migrate(chroma_client, dst_client, batch_size=200)
+    assert summary1["total"] > 0
+    assert verify(chroma_client, dst_client)
+
+    # Phase 2: user keeps using Chroma -- a brand-new KB plus extra docs in KB 0.
+    ingest_documents(chroma_client, names[2], _make_documents(2, 0), embedding_function)
+    ingest_documents(chroma_client, names[0], _make_documents(0, 1), embedding_function)
+
+    chroma_total = sum(
+        len(set(chroma_client.get(collection_name=n).ids[0])) for n in names
+    )
+
+    # Re-run incrementally: only the delta should be migrated.
+    summary2 = migrate(chroma_client, dst_client, batch_size=200, incremental=True)
+    assert summary2["total"] > 0
+    assert summary2["total"] < chroma_total, "incremental run should only migrate the delta"
+    # Target is now fully in sync with Chroma.
+    assert verify(chroma_client, dst_client)
+
+    # Re-running incremental again migrates nothing (already synced).
+    summary3 = migrate(chroma_client, dst_client, batch_size=200, incremental=True)
+    assert summary3["total"] == 0, "a second incremental run should be a no-op"
