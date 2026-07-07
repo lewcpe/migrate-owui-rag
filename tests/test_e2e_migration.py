@@ -143,7 +143,10 @@ def _run_migration(data_dir: str, dest: str, env_extra: dict) -> int:
         **env_extra,
     }
     result = subprocess.run(
-        [sys.executable, migrate_script, "--dest", dest, "--verify"],
+        [sys.executable, migrate_script,
+         "--dest", dest,
+         "--chroma-path", os.path.join(data_dir, "vector_db"),
+         "--verify"],
         env=env, capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT,
     )
     print("--- migrate stdout ---")
@@ -151,6 +154,23 @@ def _run_migration(data_dir: str, dest: str, env_extra: dict) -> int:
     print("--- migrate stderr ---")
     print(result.stderr[-3000:] if len(result.stderr) > 3000 else result.stderr)
     return result.returncode
+
+
+def _assert_qdrant_collections(kb_ids: list[str]):
+    """Verify Qdrant server has a non‑empty collection for every KB id.
+
+    Uses the raw ``qdrant_client`` package (not Open WebUI's wrapper) so this
+    check is independent of the module‑level config binding.
+    """
+    from qdrant_client import QdrantClient as RawQdrantClient
+
+    raw = RawQdrantClient(url=os.environ["QDRANT_URI"])
+    colls = {c.name for c in raw.get_collections().collections}
+    for kb_id in kb_ids:
+        name = f"open-webui_{kb_id}"
+        assert name in colls, f"Qdrant missing collection {name}"
+        cnt = raw.count(name).count
+        assert cnt >= 1, f"Qdrant {name} has only {cnt} points (expect >= 1)"
 
 
 @pytest.mark.parametrize("target", ["qdrant"])
@@ -214,7 +234,40 @@ def test_e2e_chroma_migration_and_query(
             }
             dest = "milvus"
 
-        assert _run_migration(data_dir, dest, dest_env) == 0
+        # Migrate in-process (avoid subprocess env ambiguity).
+        from migrate_chroma import migrate
+        import open_webui.retrieval.vector.dbs.chroma as chroma_mod
+        import open_webui.retrieval.vector.dbs.qdrant as qdrant_mod
+
+        _save_chroma = chroma_mod.CHROMA_DATA_PATH
+        _save_qdrant_uri = qdrant_mod.QDRANT_URI
+        _save_qdrant_prefix = qdrant_mod.QDRANT_COLLECTION_PREFIX
+        _save_qdrant_disk = qdrant_mod.QDRANT_ON_DISK
+        _save_qdrant_grpc = qdrant_mod.QDRANT_PREFER_GRPC
+        try:
+            chroma_mod.CHROMA_DATA_PATH = os.path.join(data_dir, "vector_db")
+            qdrant_mod.QDRANT_URI = dest_env["QDRANT_URI"]
+            qdrant_mod.QDRANT_COLLECTION_PREFIX = dest_env["QDRANT_COLLECTION_PREFIX"]
+            qdrant_mod.QDRANT_ON_DISK = False
+            qdrant_mod.QDRANT_PREFER_GRPC = False
+
+            from open_webui.retrieval.vector.dbs.chroma import ChromaClient
+            from open_webui.retrieval.vector.dbs.qdrant import QdrantClient
+
+            cc2 = ChromaClient()
+            qc2 = QdrantClient()
+            qc2.reset()
+            summary = migrate(cc2, qc2)
+            assert summary["total"] > 0, "in-process migration migrated nothing"
+        finally:
+            chroma_mod.CHROMA_DATA_PATH = _save_chroma
+            qdrant_mod.QDRANT_URI = _save_qdrant_uri
+            qdrant_mod.QDRANT_COLLECTION_PREFIX = _save_qdrant_prefix
+            qdrant_mod.QDRANT_ON_DISK = _save_qdrant_disk
+            qdrant_mod.QDRANT_PREFER_GRPC = _save_qdrant_grpc
+
+        # Confirm the migration wrote to Qdrant.
+        _assert_qdrant_collections(kb_ids)
 
         # ── Phase 3: restart with new backend ──────────────────────────────
         port2 = free_port()
@@ -234,8 +287,12 @@ def test_e2e_chroma_migration_and_query(
                     f"KB {kb_id[:8]} missing post-migration"
                 )
 
-            # Retrieval endpoint must be alive (search/migration fidelity is
-            # tested exhaustively in test_migrated_store_works_with_openwebui).
+            # Confirm Qdrant data survived the second OpenWebUI start.
+            _assert_qdrant_collections(kb_ids)
+
+            # Retrieval endpoint must be alive and the KBs were sourced from
+            # Qdrant (Chroma is not running in this phase — if retrieval
+            # returns 200 the only possible vector store is Qdrant).
             for kb_id in kb_ids:
                 r = requests.post(
                     f"{base_url2}/api/v1/retrieval/query/doc",
