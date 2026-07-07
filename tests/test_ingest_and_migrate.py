@@ -276,3 +276,57 @@ def test_direct_insert_vs_chroma_migration(chroma_client, dst_client, embedding_
     for h in original:
         assert original[h] <= direct[h], f"direct insert lost lines for doc {h}"
         assert original[h] <= migrated[h], f"chroma->target migration lost lines for doc {h}"
+
+
+@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"], indirect=True)
+def test_migrated_store_works_with_openwebui(chroma_client, dst_client, embedding_function):
+    """After migrating Chroma -> target, the target must behave like a normal
+    Open WebUI vector store: a user can query it, add knowledge, and delete.
+
+    Every operation goes through Open WebUI's own client (``search`` / ``insert``
+    / ``delete``) -- exactly the code path the Open WebUI API uses -- so this
+    confirms the migrated store is not just byte-equal but actually usable.
+    """
+    name = _kb_collection_name(0)
+    docs = _make_documents(0, 0)
+
+    # Migrate Chroma -> target.
+    ingest_documents(chroma_client, name, docs, embedding_function)
+    migrate(chroma_client, dst_client)
+
+    # 1) QUERY: a phrase present in the migrated data is retrievable.
+    q = asyncio.run(embedding_function(["knowledge base migration testing"], prefix=""))
+    res = dst_client.search(collection_name=name, vectors=q, limit=5)
+    assert res is not None and res.ids and len(res.ids[0]) > 0
+
+    # 2) ADD KNOWLEDGE: insert a brand-new document into the same collection.
+    new_doc = [{
+        "title": "extra-knowledge.txt",
+        "content": "Unique migration sanity phrase ZZZ-ALPHA-1234 about OpenWebUI RAG operations.",
+        "file_id": "file-extra",
+        "hash": "hash-extra",
+    }]
+    before = len(_all_ids(dst_client, name))
+    n_added = ingest_documents(dst_client, name, new_doc, embedding_function)
+    assert n_added >= 1
+    after_ids = _all_ids(dst_client, name)
+    assert len(after_ids) == before + n_added
+
+    # The freshly-added knowledge is queryable. Embed the *exact* stored chunk
+    # text (the mock embedding is text-sensitive) so the search returns it.
+    added_docs = _all_docs(dst_client, name)
+    new_texts = [v for v in added_docs.values() if v and "ZZZ-ALPHA-1234" in v]
+    assert new_texts, "added knowledge is not present in the store"
+    q2 = asyncio.run(embedding_function(new_texts, prefix=""))
+    res2 = dst_client.search(collection_name=name, vectors=q2, limit=5)
+    assert res2 is not None and res2.ids and len(res2.ids[0]) > 0
+    new_ids = {_norm_id(k) for k, v in added_docs.items() if v and "ZZZ-ALPHA-1234" in v}
+    res2_ids_norm = {_norm_id(i) for i in res2.ids[0]}
+    assert new_ids & res2_ids_norm, "added knowledge is not returned by search"
+
+    # 3) DELETE: remove one existing point and confirm it is gone.
+    victim = next(iter(after_ids))
+    dst_client.delete(collection_name=name, ids=[victim])
+    remaining = _all_ids(dst_client, name)
+    assert victim not in remaining
+    assert len(remaining) == len(after_ids) - 1
