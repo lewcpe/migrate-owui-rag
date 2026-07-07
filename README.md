@@ -164,62 +164,62 @@ still runs).
   `Collection.get(include=["embeddings", ...])` directly.
 - Milvus server image version must match `pymilvus` (v2.6.14).
 
-## Chunking analysis: migration vs. direct insert
+## Chunking analysis: migration vs. native insert
 
 A natural question is whether migrating an existing Chroma store into a target
 backend yields the **same** vectors as if Open WebUI had been writing to that
-target backend all along. In general it does **not**, and the reason is rooted
-in how Open WebUI writes to Chroma, not in the migration script.
+target backend all along. The answer depends on how you compare the two stores.
+
+### Open WebUI does the same chunking regardless of vector DB
+
+Open WebUI's file‑processing pipeline (text extraction, splitting via
+`RAG_TEXT_SPLITTER`, embedding) runs **identically** whatever `VECTOR_DB` is
+configured.  The same source document uploaded to Chroma and to Qdrant
+produces the *same* chunks with the *same* texts and the *same* embeddings
+because the splitter and embedding engine are shared.
+
+### Where the stores differ
+
+The difference lives entirely **inside each backend's Open WebUI client**:
+
+| Backend | Client behaviour | Result |
+| --- | --- | --- |
+| Chroma | `ChromaClient.insert` re‑splits each handed‑in item into several finer sub‑documents (observed ~3× more chunks with finer texts). | Stored document count **>** number of pipeline chunks. |
+| Qdrant / Milvus | `QdrantClient.insert` / `MilvusClient.insert` stores every item *as‑is* — no further splitting. | Stored point count **==** number of pipeline chunks. |
+
+So when you upload the same file through Open WebUI's API to each backend,
+*internally* the pipeline produces N chunks, but:
+
+* **Chroma** stores **K** documents (K > N, due to re‑splitting).
+* **Qdrant** stores **N** points (no re‑splitting).
+
+After migrating Chroma → Qdrant, the Qdrant store contains **K** points (the
+Chroma layout).  If Open WebUI had been using Qdrant from the start, that
+store would contain **N** points (the native Qdrant layout).
 
 ### What the migration preserves
 
-The migration is a faithful, lossless copy of whatever Chroma already stored:
-every Chroma point (id, document text, embedding, metadata) is re-created 1:1 in
-the target via `upsert`. The existing `test_offline_migration_chroma_to_vector`
-test asserts exactly this (id sets match, and verbatim document text matches).
+The migration is a faithful, lossless copy of what Chroma already stored:
+every Chroma point (id, text, embedding, metadata) is re‑created 1:1 in the
+target.  The `test_offline_migration_chroma_to_vector` test asserts exactly
+this (id‑set equality, verbatim document text).
 
-### Where the two paths diverge
+### How the test accounts for the difference
 
-Open WebUI's `ChromaClient.insert` does **not** store the items you hand it
-verbatim. It re-splits each item into several finer sub-documents. In the test
-scenario (30 documents × 6 paragraphs, chunked with the langchain
-`RecursiveCharacterTextSplitter` at `chunk_size=1000`, `chunk_overlap=100`):
+Because the layouts differ (different chunk distributions, different ids),
+`test_direct_insert_vs_chroma_migration` does **not** assert byte‑identical
+collections.  Instead it groups points by `metadata.hash` (the original source
+document) and verifies that **every original line of text is recoverable from
+both stores** — both layouts preserve the same knowledge, just at different
+granularities.
 
-| Path | Input chunks | Stored vectors | Chunk granularity |
-| --- | --- | --- | --- |
-| Direct insert into Qdrant/Milvus (`ingest_documents` → `client.insert`) | 60 | **60** | one vector per langchain chunk |
-| Insert into Chroma, then migrate to Qdrant/Milvus | 60 → Chroma → migrate | **~180** | Chroma re-split each item into ~3 finer sub-documents |
+### Takeaway
 
-So a Chroma → Qdrant migration produces roughly **3× more, shorter chunks**
-than a direct Qdrant insert of the same source documents, and the individual
-chunk texts differ (Chroma's fragments are finer than the langchain chunks).
-This was confirmed empirically: 60 langchain chunks produced **180** documents
-in Chroma (lengths ~400–810 chars), whereas the direct Qdrant insert kept the
-60 original langchain chunks.
+* **To get the exact same experience as the old Chroma store**: migrate
+  (faithful copy of Chroma's finer chunks → same search behaviour).
+* **To get the native Qdrant/Milvus layout**: re‑ingest documents directly
+  into the new backend through Open WebUI's API (coarser chunks, different
+  search behaviour).
 
-### Why this is expected, not a bug
-
-- The migration copies Chroma's *actual* stored layout. Reconstructing the
-  finer Chroma chunks in the target is the **correct** behaviour — it means the
-  migrated store behaves exactly like the Chroma store it came from (same
-  search results, same retrieval).
-- The difference originates entirely in the **source** backend (Chroma's
-  client re-chunks on write). A direct insert into Qdrant/Milvus bypasses
-  Chroma, so it keeps the coarser langchain chunking.
-- The exact ratio depends on document length and the configured chunk size /
-  overlap; it is not a fixed constant.
-
-### How the test accounts for this
-
-Because ids, counts and per-chunk vectors legitimately differ between the two
-paths, `test_direct_insert_vs_chroma_migration` does **not** assert
-byte-identical collections. Instead it groups each store's points by
-`metadata.hash` (the original source document) and verifies that **every
-original line of text is recoverable from both stores**. Both paths preserve
-the same underlying knowledge — they just slice it differently.
-
-**Takeaway:** prefer migrating Chroma → target over standing up a fresh target
-store and re-ingesting, *if* you want the new store to match the existing
-Chroma-backed experience. If instead you re-ingest the same files directly into
-the target backend, you will get coarser chunks and therefore different search
-behaviour than the Chroma system you are replacing.
+Neither approach is “wrong” — they serve different goals.  The tests verify
+both.
