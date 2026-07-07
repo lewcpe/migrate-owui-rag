@@ -57,6 +57,7 @@ from open_webui.config import (  # noqa: E402
 from open_webui.retrieval.utils import get_embedding_function  # noqa: E402
 from open_webui.retrieval.vector.dbs.chroma import ChromaClient  # noqa: E402
 from open_webui.retrieval.vector.dbs.milvus import MilvusClient  # noqa: E402
+from open_webui.retrieval.vector.dbs.qdrant import QdrantClient  # noqa: E402
 from open_webui.utils.misc import sanitize_text_for_db  # noqa: E402
 from langchain_core.documents import Document  # noqa: E402
 from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E402
@@ -178,13 +179,107 @@ def chroma_client(tmp_path, monkeypatch):
 
 @pytest.fixture
 def milvus_client(milvus_server, monkeypatch):
-    # Point at the Docker Milvus server (set by the milvus_server fixture).
-    monkeypatch.setattr("open_webui.config.MILVUS_URI", os.environ["MILVUS_URI"])
-    monkeypatch.setattr("open_webui.config.MILVUS_DB", os.environ.get("MILVUS_DB", "default"))
-    monkeypatch.setattr("open_webui.config.ENABLE_MILVUS_MULTITENANCY_MODE", False)
+    # Point at the Docker Milvus server. The open_webui Milvus client binds
+    # config values at import time, so patch the dbs module (not just config).
+    import open_webui.retrieval.vector.dbs.milvus as milvus_mod
+
+    monkeypatch.setattr(milvus_mod, "MILVUS_URI", os.environ["MILVUS_URI"])
+    monkeypatch.setattr(milvus_mod, "MILVUS_DB", os.environ.get("MILVUS_DB", "default"))
+    monkeypatch.setattr(milvus_mod, "MILVUS_TOKEN", os.environ.get("MILVUS_TOKEN", ""))
     client = MilvusClient()
     client.reset()  # isolate each test: drop any open_webui_* collections
     return client
+
+
+@pytest.fixture(scope="session")
+def qdrant_server():
+    """Start a real Qdrant server via docker compose (session-scoped).
+
+    Uses ``docker-compose.qdrant.yml``. Skipped automatically if Docker /
+    docker compose is unavailable.
+    """
+    if shutil.which("docker") is None:
+        pytest.skip("docker not available")
+
+    compose_bin = "docker" if shutil.which("docker") and _compose_present() else None
+    if compose_bin is None:
+        pytest.skip("docker compose not available")
+
+    compose_file = str(Path(__file__).resolve().parent.parent / "docker-compose.qdrant.yml")
+    host, port = "127.0.0.1", 6333
+
+    try:
+        subprocess.run(
+            ["docker", "compose", "-f", compose_file, "up", "-d", "--wait"],
+            check=True,
+            capture_output=True,
+            timeout=600,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        pytest.skip(f"could not start Qdrant stack: {e}")
+
+    if not _wait_for_port(host, port, timeout=120):
+        subprocess.run(["docker", "compose", "-f", compose_file, "down", "-v"], capture_output=True)
+        pytest.skip("Qdrant server did not become ready in time")
+
+    os.environ["QDRANT_URI"] = f"http://{host}:{port}"
+    os.environ["QDRANT_COLLECTION_PREFIX"] = "open-webui"
+    os.environ["QDRANT_ON_DISK"] = "false"
+    os.environ["QDRANT_PREFER_GRPC"] = "false"
+
+    # Wait until the REST API actually accepts requests. Use the raw qdrant
+    # client here (not the Open WebUI wrapper) so we don't depend on
+    # open_webui.config.QDRANT_URI being set yet.
+    from qdrant_client import QdrantClient as _RawQdrantClient
+
+    ready = False
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            _RawQdrantClient(url=os.environ["QDRANT_URI"]).get_collections()
+            ready = True
+            break
+        except Exception:
+            time.sleep(2)
+    if not ready:
+        subprocess.run(["docker", "compose", "-f", compose_file, "down", "-v"], capture_output=True)
+        pytest.skip("Qdrant server did not become ready (API) in time")
+
+    yield f"http://{host}:{port}"
+
+    subprocess.run(["docker", "compose", "-f", compose_file, "down", "-v"], capture_output=True)
+
+
+@pytest.fixture
+def qdrant_client(qdrant_server, monkeypatch):
+    # Point at the Docker Qdrant server. The open_webui Qdrant client binds
+    # config values at import time, so patch the dbs module (not just config).
+    import open_webui.retrieval.vector.dbs.qdrant as qdrant_mod
+
+    monkeypatch.setattr(qdrant_mod, "QDRANT_URI", os.environ["QDRANT_URI"])
+    monkeypatch.setattr(qdrant_mod, "QDRANT_COLLECTION_PREFIX", os.environ.get("QDRANT_COLLECTION_PREFIX", "open-webui"))
+    monkeypatch.setattr(qdrant_mod, "QDRANT_ON_DISK", False)
+    monkeypatch.setattr(qdrant_mod, "QDRANT_PREFER_GRPC", False)
+    client = QdrantClient()
+    client.reset()  # isolate each test: drop any open-webui_* collections
+    return client
+
+
+@pytest.fixture
+def dst_client(request):
+    """Parametrized destination client: yields a Milvus or Qdrant client.
+
+    Use with ``@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"],
+    indirect=True)``. The relevant server fixture is invoked lazily, so a
+    missing Docker daemon only skips the unsupported backend.
+    """
+    backend = request.param
+    if backend == "milvus":
+        yield request.getfixturevalue("milvus_client")
+    elif backend == "qdrant":
+        yield request.getfixturevalue("qdrant_client")
+    else:
+        raise ValueError(f"unknown dst_client backend: {backend}")
 
 
 def ingest_documents(

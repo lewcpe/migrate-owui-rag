@@ -12,11 +12,12 @@ what the running application expects. No Open WebUI server is required.
 
 ```
 migrate-owui-rag/
-├── migrate_chroma_to_milvus.py   # offline migration CLI (reuses open_webui clients)
-├── docker-compose.milvus.yml     # etcd + RustFS + Milvus v2.6.14 for local testing
+├── migrate_chroma.py            # offline migration CLI (reuses open_webui clients)
+├── docker-compose.milvus.yml    # etcd + RustFS + Milvus v2.6.14 for local testing
+├── docker-compose.qdrant.yml    # Qdrant server for local testing
 ├── tests/
 │   ├── mock_embedding_server.py  # Ollama-compatible /api/embed mock (deterministic)
-│   ├── conftest.py               # fixtures: mock embed server, Chroma/Milvus clients
+│   ├── conftest.py               # fixtures: mock embed server, Chroma/Milvus/Qdrant clients
 │   └── test_ingest_and_migrate.py
 ├── pyproject.toml
 └── requirements.txt              # full, proven dependency set
@@ -60,6 +61,11 @@ surface as `AllocTimestamp` "not implemented" gRPC errors. This stack uses
 
 ## Run the migration
 
+The target backend is selected with `--dest` (`milvus`, the default, or
+`qdrant`).
+
+### To a Milvus server
+
 ```bash
 export CHROMA_DATA_PATH=/path/to/open-webui/data/vector_db
 export MILVUS_URI=http://127.0.0.1:19530
@@ -69,23 +75,44 @@ export ENABLE_MILVUS_MULTITENANCY_MODE=false
 export OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend
 
 # dry run: list collections + counts, write nothing
-python migrate_chroma_to_milvus.py --dry-run
+python migrate_chroma.py --dest milvus --dry-run
 
 # real migration with verification
-python migrate_chroma_to_milvus.py --batch 500 --verify
+python migrate_chroma.py --dest milvus --batch 500 --verify
+```
+
+### To a Qdrant server
+
+```bash
+export CHROMA_DATA_PATH=/path/to/open-webui/data/vector_db
+export QDRANT_URI=http://127.0.0.1:6333
+export QDRANT_COLLECTION_PREFIX=open-webui
+export OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend
+
+# dry run
+python migrate_chroma.py --dest qdrant --dry-run
+
+# real migration with verification
+python migrate_chroma.py --dest qdrant --batch 500 --verify
 ```
 
 ### CLI flags
 
 | Flag | Env | Meaning |
 | --- | --- | --- |
+| `--dest` | `MIGRATE_DEST` | Target backend: `milvus` (default) or `qdrant` |
 | `--chroma-path` | `CHROMA_DATA_PATH` | Chroma data directory |
 | `--milvus-uri` | `MILVUS_URI` | Milvus server URI |
 | `--milvus-db` | `MILVUS_DB` | Milvus database name |
 | `--milvus-token` | `MILVUS_TOKEN` | Auth token (if enabled) |
 | `--metric` | `MILVUS_METRIC_TYPE` | Distance metric (keep `COSINE`) |
 | `--index-type` | `MILVUS_INDEX_TYPE` | e.g. `HNSW` |
-| `--multitenancy` | `ENABLE_MILVUS_MULTITENANCY_MODE` | target multitenancy mode |
+| `--multitenancy` | `ENABLE_MILVUS_MULTITENANCY_MODE` | target multitenancy mode (Milvus) |
+| `--qdrant-uri` | `QDRANT_URI` | Qdrant server URI |
+| `--qdrant-api-key` | `QDRANT_API_KEY` | Qdrant API key (if enabled) |
+| `--qdrant-prefix` | `QDRANT_COLLECTION_PREFIX` | Qdrant collection prefix (default `open-webui`) |
+| `--qdrant-on-disk` | `QDRANT_ON_DISK` | store vectors on disk (Qdrant) |
+| `--qdrant-prefer-grpc` | `QDRANT_PREFER_GRPC` | use gRPC transport (Qdrant) |
 | `--batch` | — | upsert batch size (default 500) |
 | `--collections` | — | migrate only these collection names |
 | `--dry-run` | — | list collections/counts, write nothing |
@@ -108,22 +135,30 @@ Rollback is just `VECTOR_DB=chroma` again; the Chroma data is left untouched.
 
 The pytest suite emulates a user uploading **hundreds of documents across
 multiple knowledge bases** (each KB == one vector collection) via the mock
-embedding server, then migrates Chroma → Milvus offline and verifies fidelity.
+embedding server, then migrates Chroma → the target store (Milvus **and**
+Qdrant) offline and verifies fidelity. The two migration tests are
+parametrized over both backends.
 
 ```bash
 docker compose -f docker-compose.milvus.yml up -d
+docker compose -f docker-compose.qdrant.yml up -d
 WEBUI_SECRET_KEY=test OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend \
     uv run pytest tests/test_ingest_and_migrate.py -v
 ```
 
-The Milvus fixture auto-skips if Docker / docker compose is unavailable.
+The Milvus / Qdrant server fixtures auto-skip if Docker / docker compose is
+unavailable, so the suite degrades gracefully (the embedding + ingest test
+still runs).
 
 ### Notes / gotchas
 
-- Milvus caps `limit`/`offset` at `16384`; enumeration helpers paginate.
-- Freshly-upserted Milvus data is not `search`-visible until sealed/indexed, so
-  verification enumerates via `flush()` + `query()` (which reads data
-  immediately) rather than `search()`.
+- Milvus caps `limit`/`offset` at `16384`; verification enumerates with
+  `flush()` + `query()` and paginates.
+- Qdrant enumeration uses `scroll()` with an `offset` cursor (default page
+  size `16384`).
+- Freshly-upserted data is not `search`-visible until sealed/indexed, so
+  verification enumerates via `flush()`+`query()` (Milvus) / `scroll()`
+  (Qdrant), which read inserted data immediately, rather than `search()`.
 - Chroma's wrapped `.get()` omits embeddings; the script calls the underlying
   `Collection.get(include=["embeddings", ...])` directly.
 - Milvus server image version must match `pymilvus` (v2.6.14).

@@ -12,6 +12,7 @@ dependencies = [
     "langchain-core",
     "langchain-text-splitters",
     "pytest",
+    "qdrant-client",
 ]
 
 [tool.uv]

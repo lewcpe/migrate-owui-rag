@@ -18,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import pytest
+
 from tests.conftest import ingest_documents
-from migrate_chroma_to_milvus import migrate, verify, _all_ids, _all_docs
+from migrate_chroma import migrate, verify, _all_ids, _all_docs
 
 # Test scenario: 5 knowledge bases, ~30 documents each -> hundreds of docs, and
 # because each document is multi-paragraph it yields several chunks, so the
@@ -92,8 +94,9 @@ def test_ingest_multiple_knowledge_bases(chroma_client, embedding_function):
     assert res is not None and res.ids and len(res.ids[0]) > 0
 
 
-def test_offline_migration_chroma_to_milvus(
-    chroma_client, milvus_client, embedding_function
+@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"], indirect=True)
+def test_offline_migration_chroma_to_vector(
+    chroma_client, dst_client, embedding_function
 ):
     # 1) Ingest into Chroma (multiple KBs, hundreds of docs).
     for kb in range(NUM_KB):
@@ -101,41 +104,42 @@ def test_offline_migration_chroma_to_milvus(
             chroma_client, _kb_collection_name(kb), _make_documents(kb, 0), embedding_function
         )
 
-    # 2) Migrate offline Chroma -> Milvus.
-    summary = migrate(chroma_client, milvus_client, batch_size=200)
+    # 2) Migrate offline Chroma -> target vector store.
+    summary = migrate(chroma_client, dst_client, batch_size=200)
     assert summary["total"] > 0
 
-    # 3) Verify every collection landed in Milvus with matching counts.
-    assert verify(chroma_client, milvus_client)
+    # 3) Verify every collection landed in the target with matching counts.
+    assert verify(chroma_client, dst_client)
 
-    # 4) Spot-check content fidelity on one collection. Use a query-based
-    #    enumeration (not ``search``): freshly-upserted data is not searchable
-    #    until it is sealed/indexed, whereas ``query`` sees it immediately.
+    # 4) Spot-check content fidelity on one collection via enumeration
+    #    (not ``search``): freshly-upserted data is not searchable until it is
+    #    sealed/indexed, whereas flush+query / scroll sees it immediately.
     name = _kb_collection_name(0)
     chroma_res = chroma_client.get(collection_name=name)
-    milvus_ids = _all_ids(milvus_client, name, dim=384)
-    assert set(chroma_res.ids[0]) == milvus_ids
+    dst_ids = _all_ids(dst_client, name)
+    assert set(chroma_res.ids[0]) == dst_ids
 
-    mtexts = _all_docs(milvus_client, name)
+    mtexts = _all_docs(dst_client, name)
     ctexts = {i: t for i, t in zip(chroma_res.ids[0], chroma_res.documents[0])}
     assert ctexts == mtexts
 
-    # 5) Milvus search works post-migration.
+    # 5) Target search works post-migration.
     q = asyncio.run(embedding_function(["knowledge base migration testing"], prefix=""))
-    res = milvus_client.search(collection_name=name, vectors=q, limit=3)
+    res = dst_client.search(collection_name=name, vectors=q, limit=3)
     assert res is not None and res.ids and len(res.ids[0]) > 0
 
 
-def test_migration_is_idempotent(chroma_client, milvus_client, embedding_function):
+@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"], indirect=True)
+def test_migration_is_idempotent(chroma_client, dst_client, embedding_function):
     ingest_documents(
         chroma_client, _kb_collection_name(0), _make_documents(0, 0), embedding_function
     )
-    migrate(chroma_client, milvus_client)
-    first = milvus_client.get(collection_name=_kb_collection_name(0))
+    migrate(chroma_client, dst_client)
+    first = dst_client.get(collection_name=_kb_collection_name(0))
     first_n = len(first.ids[0]) if first.ids else 0
 
     # Re-running the migration must not duplicate (upsert by id).
-    migrate(chroma_client, milvus_client)
-    second = milvus_client.get(collection_name=_kb_collection_name(0))
+    migrate(chroma_client, dst_client)
+    second = dst_client.get(collection_name=_kb_collection_name(0))
     second_n = len(second.ids[0]) if second.ids else 0
     assert first_n == second_n
