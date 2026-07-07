@@ -57,6 +57,32 @@ class _Handler(BaseHTTPRequestHandler):
             texts = data.get("input", [])
             embeddings = embed_batch(texts, self.server.dim)  # type: ignore[attr-defined]
             self._send({"embeddings": embeddings, "model": data.get("model", "mock")})
+        elif self.path.rstrip("/") == "/api/chat":
+            self._send(
+                {
+                    "model": data.get("model", "mock-model"),
+                    "message": {
+                        "role": "assistant",
+                        "content": "Mock response from the test LLM.",
+                    },
+                    "done": True,
+                }
+            )
+        else:
+            self._send({"error": "not found"}, status=404)
+
+    def do_GET(self):  # noqa: N802  (http.server API)
+        if self.path.rstrip("/") == "/api/tags":
+            self._send(
+                {
+                    "models": [
+                        {"name": "mock-model:latest", "model": "mock-model:latest"},
+                        {"name": "mock-embedding:latest", "model": "mock-embedding:latest"},
+                    ]
+                }
+            )
+        elif self.path.rstrip("/") == "/api/version":
+            self._send({"version": "0.0.0-mock"})
         else:
             self._send({"error": "not found"}, status=404)
 
