@@ -1,98 +1,57 @@
 # migrate-owui-rag
 
-Offline migration of an **Open WebUI** ChromaDB vector store to a **Milvus
-server** (standalone cluster: etcd + S3-compatible object store + Milvus).
+Offline migration of an **Open WebUI** ChromaDB vector store to another vector
+backend. Currently supports **Milvus** and **Qdrant**.
 
-The migration reuses Open WebUI's own `ChromaClient` / `MilvusClient` so
-collection naming (`open_webui_` prefix + `-` → `_`), schema/dimension
-creation, `process_metadata`, and the `MILVUS_TEXT_MAX_LENGTH` clamp all match
-what the running application expects. No Open WebUI server is required.
+Reuses Open WebUI's own clients so collection naming, schemas, and metadata
+processing match the running application. No Open WebUI server is required.
 
-## Layout
+## Setup
 
-```
-migrate-owui-rag/
-├── migrate_chroma.py            # offline migration CLI (reuses open_webui clients)
-├── docker-compose.milvus.yml    # etcd + RustFS + Milvus v2.6.14 for local testing
-├── docker-compose.qdrant.yml    # Qdrant server for local testing
-├── tests/
-│   ├── mock_embedding_server.py  # Ollama-compatible /api/embed mock (deterministic)
-│   ├── conftest.py               # fixtures: mock embed server, Chroma/Milvus/Qdrant clients
-│   └── test_ingest_and_migrate.py
-├── pyproject.toml
-└── requirements.txt              # full, proven dependency set
-```
-
-## Dependencies on Open WebUI
-
-This tool is not self-contained: it imports `open_webui.retrieval.vector.dbs.*`,
-`open_webui.config`, etc. Those modules live in a checkout of Open WebUI and are
-**not** pip-installable on their own. By default this project expects a sibling
-checkout at `../open-webui-0.10.2/backend` (relative to this project's root).
-Override the location with the `OPEN_WEBUI_BACKEND` environment variable:
+This tool imports from a checkout of Open WebUI. Point `OPEN_WEBUI_BACKEND` at
+the `backend/` directory (default: `../open-webui-0.10.2/backend`):
 
 ```bash
 export OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend
-```
 
-## Setup (uv)
-
-```bash
 cd migrate-owui-rag
 uv venv --python 3.11
-uv pip install -r requirements.txt      # proven set from the working env
-# make open_webui importable in this venv (points at the sibling checkout):
+uv pip install -r requirements.txt
 echo "/abs/path/to/open-webui-0.10.2/backend" > .venv/lib/python3.11/site-packages/open_webui_backend.pth
 ```
 
-Alternatively, set `OPEN_WEBUI_BACKEND` at runtime (the scripts also insert that
-path into `sys.path` automatically).
-
-## Stand up a Milvus server (local testing)
+## Local test servers
 
 ```bash
-docker compose -f docker-compose.milvus.yml up -d
-# -> Milvus gRPC on http://127.0.0.1:19530
+docker compose -f docker-compose.milvus.yml up -d  # gRPC on :19530
+docker compose -f docker-compose.qdrant.yml up -d  # REST on :6333
 ```
 
-Pin the image to the **same version** as `pymilvus` (here `v2.6.14`); mismatches
-surface as `AllocTimestamp` "not implemented" gRPC errors. This stack uses
-[RustFS](https://rustfs.com) as the S3-compatible object store in place of MinIO.
+The Milvus image must match `pymilvus` (v2.6.14). The stack uses RustFS as the
+S3-compatible object store.
 
-## Run the migration
+## Usage
 
-The target backend is selected with `--dest` (`milvus`, the default, or
-`qdrant`).
+Target backend is selected with `--dest` (`milvus` default, or `qdrant`).
 
-### To a Milvus server
+### Milvus
 
 ```bash
 export CHROMA_DATA_PATH=/path/to/open-webui/data/vector_db
 export MILVUS_URI=http://127.0.0.1:19530
-export MILVUS_DB=default
-export MILVUS_METRIC_TYPE=COSINE          # MUST match Chroma's cosine
-export ENABLE_MILVUS_MULTITENANCY_MODE=false
-export OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend
+export MILVUS_METRIC_TYPE=COSINE
 
-# dry run: list collections + counts, write nothing
 python migrate_chroma.py --dest milvus --dry-run
-
-# real migration with verification
 python migrate_chroma.py --dest milvus --batch 500 --verify
 ```
 
-### To a Qdrant server
+### Qdrant
 
 ```bash
 export CHROMA_DATA_PATH=/path/to/open-webui/data/vector_db
 export QDRANT_URI=http://127.0.0.1:6333
-export QDRANT_COLLECTION_PREFIX=open-webui
-export OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend
 
-# dry run
 python migrate_chroma.py --dest qdrant --dry-run
-
-# real migration with verification
 python migrate_chroma.py --dest qdrant --batch 500 --verify
 ```
 
@@ -100,138 +59,66 @@ python migrate_chroma.py --dest qdrant --batch 500 --verify
 
 | Flag | Env | Meaning |
 | --- | --- | --- |
-| `--dest` | `MIGRATE_DEST` | Target backend: `milvus` (default) or `qdrant` |
+| `--dest` | `MIGRATE_DEST` | `milvus` (default) or `qdrant` |
 | `--chroma-path` | `CHROMA_DATA_PATH` | Chroma data directory |
-| `--milvus-uri` | `MILVUS_URI` | Milvus server URI |
-| `--milvus-db` | `MILVUS_DB` | Milvus database name |
-| `--milvus-token` | `MILVUS_TOKEN` | Auth token (if enabled) |
-| `--metric` | `MILVUS_METRIC_TYPE` | Distance metric (keep `COSINE`) |
-| `--index-type` | `MILVUS_INDEX_TYPE` | e.g. `HNSW` |
-| `--multitenancy` | `ENABLE_MILVUS_MULTITENANCY_MODE` | target multitenancy mode (Milvus) |
-| `--qdrant-uri` | `QDRANT_URI` | Qdrant server URI |
-| `--qdrant-api-key` | `QDRANT_API_KEY` | Qdrant API key (if enabled) |
-| `--qdrant-prefix` | `QDRANT_COLLECTION_PREFIX` | Qdrant collection prefix (default `open-webui`) |
-| `--qdrant-on-disk` | `QDRANT_ON_DISK` | store vectors on disk (Qdrant) |
-| `--qdrant-prefer-grpc` | `QDRANT_PREFER_GRPC` | use gRPC transport (Qdrant) |
 | `--batch` | — | upsert batch size (default 500) |
 | `--collections` | — | migrate only these collection names |
 | `--dry-run` | — | list collections/counts, write nothing |
-| `--incremental` | — | only migrate Chroma ids missing from the target (resumable sync) |
-| `--state-file` | — | state file for time‑based incremental (default: `.migrate_state.json`) |
+| `--incremental` | — | time-aware sync: adds missing + deletes stale records |
+| `--state-file` | — | state file for incremental (default `.migrate_state.json`) |
 | `--verify` | — | compare per-collection id sets afterwards |
 
-The script targets the **standard** Milvus mode. Milvus *multitenancy* mode
-routes every logical collection into shared physical collections, so a 1:1 copy
-will not work there without replicating the routing logic.
+**Backend-specific flags** (Milvus): `--milvus-uri`, `--milvus-db`,
+`--milvus-token`, `--metric`, `--index-type`, `--multitenancy`.
 
-## Incremental migration (time‑based)
+**Backend-specific flags** (Qdrant): `--qdrant-uri`, `--qdrant-api-key`,
+`--qdrant-prefix`, `--qdrant-on-disk`, `--qdrant-prefer-grpc`.
 
-`--incremental` now writes a state file (default `.migrate_state.json` next to
-the script) recording the timestamp when the last migration completed.
-Subsequent runs compare that timestamp against the modification time of the
-Chroma data directory:
+All flags also read from the corresponding environment variables shown above.
 
-* If **nothing** changed on disk since the last run, all processing is skipped
-  (instant no‑op).
-* If Chroma data **was** written since the last run, a per‑collection ID‑diff
-  is performed — missing records are migrated and **stale records** (present in
-  the target but not in Chroma) are deleted from the target. This naturally
-  handles newly‑created records, **re‑uploaded** files (Open WebUI assigns
-  fresh UUIDs on re‑upload), and **deleted** files.
+### Incremental mode
 
-Example cron‑friendly usage:
+`--incremental` writes a state file recording the last migration timestamp.
+Subsequent runs:
+
+- **Skip everything** if Chroma data hasn't changed on disk since the last run.
+- Otherwise do a per-collection ID-diff: add missing records and delete stale
+  ones from the target. This covers creates, re-uploads (new UUIDs), and
+  deletes.
 
 ```bash
-# First run: does a full migration and creates .migrate_state.json
-python migrate_chroma.py --dest milvus --incremental --verify
-
-# Subsequent runs: skip immediately unless new data arrived in Chroma
 python migrate_chroma.py --dest milvus --incremental --verify
 ```
 
-To reset the timestamp (force a full migration next time), delete the state
-file or pass `--state-file /dev/null`.
+Delete `.migrate_state.json` to force a full migration next time.
 
-## Switching Open WebUI to Milvus
+## Switching Open WebUI
 
-1. Set `VECTOR_DB=milvus`, `MILVUS_URI=<target used during migration>`,
-   `MILVUS_METRIC_TYPE=COSINE`, `ENABLE_MILVUS_MULTITENANCY_MODE=false`.
-2. Start Open WebUI — it now uses the migrated Milvus store.
-3. Keep the old `vector_db` (Chroma) until searches are verified, then archive.
+1. Set `VECTOR_DB=milvus` (or `qdrant`) with the URI used during migration.
+2. Restart Open WebUI — it uses the migrated store.
+3. Archive the old Chroma `vector_db` once verified.
 
-Rollback is just `VECTOR_DB=chroma` again; the Chroma data is left untouched.
+Roll back by setting `VECTOR_DB=chroma`; the Chroma data is left untouched.
 
 ## Tests
-
-The pytest suite emulates a user uploading **hundreds of documents across
-multiple knowledge bases** (each KB == one vector collection) via the mock
-embedding server, then migrates Chroma → the target store (Milvus **and**
-Qdrant) offline and verifies fidelity. The two migration tests are
-parametrized over both backends.
 
 ```bash
 docker compose -f docker-compose.milvus.yml up -d
 docker compose -f docker-compose.qdrant.yml up -d
+
 WEBUI_SECRET_KEY=test OPEN_WEBUI_BACKEND=/abs/path/to/open-webui-0.10.2/backend \
     uv run pytest tests/test_ingest_and_migrate.py -v
 ```
 
-The Milvus / Qdrant server fixtures auto-skip if Docker / docker compose is
-unavailable, so the suite degrades gracefully (the embedding + ingest test
-still runs).
+Server fixtures auto-skip when Docker is unavailable.
 
-### Notes / gotchas
+### Gotchas
 
-- Milvus caps `limit`/`offset` at `16384`; verification enumerates with
-  `flush()` + `query()` and paginates.
-- Qdrant enumeration uses `scroll()` with an `offset` cursor (default page
-  size `16384`).
-- Freshly-upserted data is not `search`-visible until sealed/indexed, so
-  verification enumerates via `flush()`+`query()` (Milvus) / `scroll()`
-  (Qdrant), which read inserted data immediately, rather than `search()`.
+- Milvus caps `limit`/`offset` at 16384; verification paginates with
+  `flush()` + `query()`.
+- Qdrant enumeration uses `scroll()` with an offset cursor.
+- Freshly-upserted data is not `search`-visible until indexed — verification
+  uses `query()` / `scroll()` instead.
 - Chroma's wrapped `.get()` omits embeddings; the script calls the underlying
   `Collection.get(include=["embeddings", ...])` directly.
-- Milvus server image version must match `pymilvus` (v2.6.14).
-
-## Chunking analysis: migration vs. direct insert
-
-Open WebUI's file‑processing pipeline (text extraction, splitting via
-`RAG_TEXT_SPLITTER`, embedding) runs **identically** whatever `VECTOR_DB` is
-configured.  The same source document uploaded through Open WebUI's API to
-Chroma, Qdrant, or Milvus produces the *same* chunks with the *same* texts and
-the *same* embeddings.
-
-### How each backend stores the chunks
-
-| Backend | Client behaviour | Result |
-| --- | --- | --- |
-| Chroma | `ChromaClient.insert` stores every item *as‑is* — `collection.add()` is a pass‑through (confirmed in tests: *N* items → *N* stored documents). | Stored count == pipeline chunk count. |
-| Qdrant / Milvus | `QdrantClient.insert` / `MilvusClient.insert` stores every item *as‑is* — no transformation. | Stored count == pipeline chunk count. |
-
-In other words, **there is no re‑splitting**.  Each backend faithfully stores
-the chunks produced by Open WebUI's shared text‑splitting phase.
-
-### What the migration preserves
-
-The migration is a faithful, lossless copy of what Chroma already stored:
-every Chroma point (id, text, embedding, metadata) is re‑created 1:1 in the
-target via ``upsert``.  The `test_offline_migration_chroma_to_vector` test
-asserts exactly this (id‑set equality, verbatim document text).
-
-### Are the two paths equivalent?
-
-Because Open WebUI chunks identically regardless of backend **and** every
-backend stores chunks as‑is, the three paths produce equivalent data:
-
-* Direct insert into Qdrant/Milvus through Open WebUI's API
-* Insert into Chroma, then migrate
-
-The only differences are backend‑level details (collection naming, point‑id
-format), not chunk count or text.  The `test_direct_insert_vs_chroma_migration`
-test verifies this by recovering every original line of text from both stores.
-
-### Takeaway
-
-Re‑ingest directly into the target backend or migrate from Chroma — both yield
-the same searchable knowledge.  Migrate if you already have data in Chroma;
-re‑ingest if you are starting fresh.
+- Milvus server image must match `pymilvus` (v2.6.14).
