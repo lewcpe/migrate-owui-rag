@@ -117,11 +117,40 @@ python migrate_chroma.py --dest qdrant --batch 500 --verify
 | `--collections` | — | migrate only these collection names |
 | `--dry-run` | — | list collections/counts, write nothing |
 | `--incremental` | — | only migrate Chroma ids missing from the target (resumable sync) |
+| `--state-file` | — | state file for time‑based incremental (default: `.migrate_state.json`) |
 | `--verify` | — | compare per-collection id sets afterwards |
 
 The script targets the **standard** Milvus mode. Milvus *multitenancy* mode
 routes every logical collection into shared physical collections, so a 1:1 copy
 will not work there without replicating the routing logic.
+
+## Incremental migration (time‑based)
+
+`--incremental` now writes a state file (default `.migrate_state.json` next to
+the script) recording the timestamp when the last migration completed.
+Subsequent runs compare that timestamp against the modification time of the
+Chroma data directory:
+
+* If **nothing** changed on disk since the last run, all processing is skipped
+  (instant no‑op).
+* If Chroma data **was** written since the last run, a per‑collection ID‑diff
+  is performed — missing records are migrated and **stale records** (present in
+  the target but not in Chroma) are deleted from the target. This naturally
+  handles newly‑created records, **re‑uploaded** files (Open WebUI assigns
+  fresh UUIDs on re‑upload), and **deleted** files.
+
+Example cron‑friendly usage:
+
+```bash
+# First run: does a full migration and creates .migrate_state.json
+python migrate_chroma.py --dest milvus --incremental --verify
+
+# Subsequent runs: skip immediately unless new data arrived in Chroma
+python migrate_chroma.py --dest milvus --incremental --verify
+```
+
+To reset the timestamp (force a full migration next time), delete the state
+file or pass `--state-file /dev/null`.
 
 ## Switching Open WebUI to Milvus
 

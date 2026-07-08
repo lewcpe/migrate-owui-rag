@@ -6,16 +6,25 @@ Reuses Open WebUI's own ``ChromaClient`` and the target backend client
 ``process_metadata`` and the text-length clamp all match what the running
 application expects. No Open WebUI server is required.
 
+Incremental mode (``--incremental``) uses a state file to track the last
+migration timestamp. Subsequent runs skip everything if no Chroma data has
+been written since the previous migration; when new data is detected it
+migrates only the records missing from the target (ID‑diff) and removes
+stale records from the target that are no longer present in Chroma.
+This naturally includes records *created* after the last migration as well
+as records *updated* with a new id (Open WebUI's "re‑upload" path always
+produces new UUIDs).
+
 Usage (env vars are also honoured):
 
     # Migrate to a Milvus server.
-    python migrate_chroma.py --dest milvus \
-        --chroma-path /path/to/data/vector_db \
+    python migrate_chroma.py --dest milvus \\
+        --chroma-path /path/to/data/vector_db \\
         --milvus-uri http://127.0.0.1:19530 --verify
 
     # Migrate to a Qdrant server.
-    python migrate_chroma.py --dest qdrant \
-        --chroma-path /path/to/data/vector_db \
+    python migrate_chroma.py --dest qdrant \\
+        --chroma-path /path/to/data/vector_db \\
         --qdrant-uri http://127.0.0.1:6333 --verify
 
 Run ``--dry-run`` first to list collections and counts without writing.
@@ -23,10 +32,12 @@ Run ``--dry-run`` first to list collections and counts without writing.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import uuid
+from datetime import datetime, timezone
 from typing import List, Optional
 
 # --- configure env BEFORE importing open_webui (config reads env at import) ---
@@ -76,6 +87,28 @@ def _apply_env(a: argparse.Namespace) -> None:
         os.environ["QDRANT_PREFER_GRPC"] = str(getattr(a, "qdrant_prefer_grpc", "false")).lower()
 
 
+# -- state file helpers for time‑based incremental ----------------------------
+
+def _read_state(state_file: str) -> dict:
+    """Read the migration state file; returns an empty dict on any problem."""
+    try:
+        with open(state_file, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _write_state(state_file: str, state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(state_file) or ".", exist_ok=True)
+        with open(state_file, "w") as fh:
+            json.dump(state, fh)
+    except Exception:
+        log.debug("could not write state file", exc_info=True)
+
+# ---------------------------------------------------------------------------
+
+
 # Pre-parse a minimal set of flags purely to set env before open_webui import.
 _pre = argparse.ArgumentParser(add_help=False)
 _add_args(_pre)
@@ -119,6 +152,23 @@ def _backend_of(client) -> str:
     return "unknown"
 
 
+def _latest_chroma_mtime(chroma_data_path: str) -> Optional[float]:
+    """Return the newest mtime (float) of any file under *chroma_data_path*,
+    or ``None`` if the path does not exist or is empty."""
+    if not os.path.isdir(chroma_data_path):
+        return None
+    latest = 0.0
+    for root, _dirs, files in os.walk(chroma_data_path):
+        for f in files:
+            try:
+                mtime = os.path.getmtime(os.path.join(root, f))
+                if mtime > latest:
+                    latest = mtime
+            except OSError:
+                pass
+    return latest if latest > 0 else None
+
+
 def migrate(
     src_client: ChromaClient,
     dst_client,
@@ -126,24 +176,63 @@ def migrate(
     collection_filter: Optional[List[str]] = None,
     dry_run: bool = False,
     incremental: bool = False,
+    state_file: Optional[str] = None,
 ) -> dict:
     """Read every Chroma collection (with embeddings) and upsert into the target.
 
     Returns a summary dict: ``{"dest": str, "collections": [(name, n), ...], "total": int}``.
 
-    When ``incremental`` is True, only the Chroma points whose ids are **not**
-    already present in the target are migrated (a diff). This makes the
-    migration resumable: you can run it once, keep writing to Chroma, and run
-    it again later to sync just the new data without re-processing everything.
+    When ``incremental`` is True with a *state_file*:
+
+    * If the Chroma data directory has **not** been modified since the last
+      migration recorded in the state file, all processing is skipped (no‑op).
+    * Otherwise, a per‑collection ID‑diff is performed: only Chroma points
+      whose ids are not already present in the target are migrated.
+    * The state file is updated with the current timestamp on completion.
+
+    When ``incremental`` is True **without** a state file the ID‑diff runs
+    unconditionally (equivalent to the old behaviour for ad‑hoc resumable
+    syncs).
+
     Because ``upsert`` is idempotent on id, a non-incremental re-run is always
     safe too, but re-processes every collection.
     """
+    # -- time‑based gating (state file) -----------------------------------
+    last_migration: Optional[float] = None
+    chroma_data_path = os.environ.get("CHROMA_DATA_PATH")
+
+    if incremental and state_file and chroma_data_path:
+        state = _read_state(state_file)
+        raw = state.get("last_migration")
+        if raw:
+            try:
+                last_migration = datetime.fromisoformat(raw).timestamp()
+            except (ValueError, TypeError):
+                log.warning("state file has unparseable last_migration; running full diff")
+                last_migration = None
+
+        if last_migration is not None:
+            latest = _latest_chroma_mtime(chroma_data_path)
+            if latest is not None and latest <= last_migration:
+                log.info(
+                    "[incremental] Chroma data unchanged since %s — nothing to migrate",
+                    raw,
+                )
+                return {"dest": _backend_of(dst_client), "collections": [], "total": 0}
+            if latest is not None:
+                log.info(
+                    "[incremental] Chroma data modified (latest mtime %s > %s); running diff",
+                    datetime.fromtimestamp(latest, tz=timezone.utc).isoformat(),
+                    raw,
+                )
+    # --------------------------------------------------------------------
+
     chroma = src_client.client
     collections = chroma.list_collections()
     names = [c.name if hasattr(c, "name") else c for c in collections]
     log.info(f"Found {len(names)} Chroma collection(s): {names}")
 
-    summary: dict = {"dest": _backend_of(dst_client), "collections": [], "total": 0}
+    summary: dict = {"dest": _backend_of(dst_client), "collections": [], "total": 0, "deleted": 0}
     for name in names:
         if collection_filter and name not in collection_filter:
             log.info(f"[skip] {name}: not in --collections filter")
@@ -175,11 +264,17 @@ def migrate(
         ]
 
         if incremental and not dry_run:
-            # Diff: only migrate points missing from the target. A missing
-            # target collection means "migrate everything".
+            # Diff: migrate missing points, delete stale ones.
+            # A missing target collection means "migrate everything".
             if dst_client.has_collection(name):
                 existing = _all_ids(dst_client, name)
+                chroma_ids = set(ids)
                 items = [it for it in items if it["id"] not in existing]
+                stale = existing - chroma_ids
+                if stale:
+                    log.info(f"[stale] {name}: removing {len(stale)} record(s) not in Chroma")
+                    dst_client.delete(collection_name=name, ids=list(stale))
+                    summary["deleted"] += len(stale)
             if not items:
                 log.info(f"[skip] {name}: nothing to migrate (already present)")
                 summary["collections"].append((name, 0))
@@ -198,6 +293,20 @@ def migrate(
         log.info(f"[done] {name}: migrated {len(items)} vector(s)")
         summary["collections"].append((name, len(items)))
         summary["total"] += len(items)
+
+    # -- write state file -------------------------------------------------
+    if incremental and state_file and not dry_run:
+        if summary["total"] > 0 or summary["deleted"] > 0:
+            _write_state(
+                state_file,
+                {
+                    "last_migration": datetime.now(timezone.utc).isoformat(),
+                    "dest": _backend_of(dst_client),
+                    "total": summary["total"],
+                    "deleted": summary["deleted"],
+                },
+            )
+    # --------------------------------------------------------------------
 
     return summary
 
@@ -352,6 +461,11 @@ def main() -> int:
         action="store_true",
         help="Only migrate Chroma ids missing from the target (resumable sync).",
     )
+    parser.add_argument(
+        "--state-file",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".migrate_state.json"),
+        help="State file for time‑based incremental (default: .migrate_state.json next to this script).",
+    )
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
 
@@ -368,9 +482,11 @@ def main() -> int:
         collection_filter=args.collections,
         dry_run=args.dry_run,
         incremental=args.incremental,
+        state_file=args.state_file if args.incremental else None,
     )
     log.info(
-        f"Summary ({summary['dest']}): {summary['total']} vectors across "
+        f"Summary ({summary['dest']}): {summary['total']} vectors migrated, "
+        f"{summary.get('deleted', 0)} stale records removed across "
         f"{len(summary['collections'])} collection(s)"
     )
 

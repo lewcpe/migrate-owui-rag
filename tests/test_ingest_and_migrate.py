@@ -16,7 +16,9 @@ or, with the uv environment:
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -369,3 +371,78 @@ def test_incremental_migration(chroma_client, dst_client, embedding_function):
     # Re-running incremental again migrates nothing (already synced).
     summary3 = migrate(chroma_client, dst_client, batch_size=200, incremental=True)
     assert summary3["total"] == 0, "a second incremental run should be a no-op"
+
+
+@pytest.mark.parametrize("dst_client", ["milvus", "qdrant"], indirect=True)
+def test_incremental_with_state_file(chroma_client, dst_client, embedding_function, tmp_path):
+    """Time‑based incremental: state file gates processing and ID‑diff moves only
+    records created/updated after the last migration.
+
+    1. Ingest → incremental with state file → data migrated, stamp recorded.
+    2. Re‑run immediately → no‑op (Chroma mtime ≤ state stamp).
+    3. Add new documents → incremental migrates only the delta.
+    4. Delete a document from Chroma → incremental finds nothing to add; stale
+       record lingers in target (by design — verify will report a mismatch).
+    """
+    state_file = str(tmp_path / ".migrate_state.json")
+    name = _kb_collection_name(0)
+
+    # -- 1) initial ingest + incremental (seeds state file) -----------------
+    ingest_documents(chroma_client, name, _make_documents(0, 0), embedding_function)
+    summary1 = migrate(
+        chroma_client, dst_client, batch_size=200,
+        incremental=True, state_file=state_file,
+    )
+    assert summary1["total"] > 0
+
+    state = json.loads(Path(state_file).read_text())
+    assert "last_migration" in state
+    first_stamp = state["last_migration"]
+    assert verify(chroma_client, dst_client)
+
+    # -- 2) re‑run immediately → no‑op (nothing changed on disk) ------------
+    summary2 = migrate(
+        chroma_client, dst_client, batch_size=200,
+        incremental=True, state_file=state_file,
+    )
+    assert summary2["total"] == 0, "re-run with unchanged Chroma must be a no-op"
+
+    # -- 3) add new documents → incremental migrates only the delta ---------
+    chroma_before = len(set(chroma_client.get(collection_name=name).ids[0]))
+    n_added = ingest_documents(
+        chroma_client, name, _make_documents(0, 1), embedding_function,
+    )
+    assert n_added > 0
+    chroma_after = len(set(chroma_client.get(collection_name=name).ids[0]))
+    delta = chroma_after - chroma_before
+
+    summary3 = migrate(
+        chroma_client, dst_client, batch_size=200,
+        incremental=True, state_file=state_file,
+    )
+    assert summary3["total"] > 0
+    assert summary3["total"] <= delta, (
+        "incremental should only migrate the new records"
+    )
+    assert verify(chroma_client, dst_client)
+
+    # State file timestamp must advance.
+    state2 = json.loads(Path(state_file).read_text())
+    assert state2["last_migration"] > first_stamp
+
+    # -- 4) delete a document from Chroma → target cleans stale record ------
+    chroma_ids = set(chroma_client.get(collection_name=name).ids[0])
+    victim = next(iter(chroma_ids))
+    dst_before = _all_ids(dst_client, name)
+    chroma_client.delete(collection_name=name, ids=[victim])
+
+    summary4 = migrate(
+        chroma_client, dst_client, batch_size=200,
+        incremental=True, state_file=state_file,
+    )
+    assert summary4["total"] == 0, "nothing to add after a delete-only change"
+    assert summary4["deleted"] == 1, "stale record must be removed from target"
+    dst_after = _all_ids(dst_client, name)
+    assert len(dst_after) == len(dst_before) - 1
+    assert victim not in dst_after, "deleted-from-Chroma id must be gone from target"
+    assert verify(chroma_client, dst_client)

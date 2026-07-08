@@ -19,3 +19,6 @@ volumes/
 .DS_Store
 .idea/
 .vscode/
+
+# Migration state file
+.migrate_state.json
